@@ -29,6 +29,13 @@
       "when": 1789689806248,
       "tag": "0003_voice_settings_and_gemini_image",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789700818669,
+      "tag": "0004_import_schema",
+      "breakpoints": true
     }
   ]
 }
