@@ -326,3 +326,153 @@ export const testVoice = createServerFn({ method: "POST" })
     );
     return { audio: Buffer.from(bytes).toString("base64"), mime: "audio/wav" };
   });
+
+/* ------------------------------------------------- Gemini key pool */
+
+export type AdminGeminiKey = {
+  id: string;
+  label: string;
+  masked: string;
+  active: boolean;
+  failures: number;
+  last_used_at: string | null;
+  created_at: string;
+};
+
+function maskKey(key: string) {
+  const trimmed = key.trim();
+  if (trimmed.length <= 8) return "••••";
+  return `${trimmed.slice(0, 4)}••••${trimmed.slice(-4)}`;
+}
+
+/** Every saved Gemini key, newest last, with the secret hidden. */
+export const listGeminiKeys = createServerFn({ method: "GET" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }): Promise<AdminGeminiKey[]> => {
+    await assertAdmin(context);
+    const admin = await db();
+    const { data, error } = await admin
+      .from("gemini_keys")
+      .select("*")
+      .order("created_at", { ascending: true });
+    if (error) throw new Error(error.message);
+    return (data ?? []).map((row) => {
+      const r = row as Record<string, unknown>;
+      return {
+        id: String(r["id"]),
+        label: String(r["label"] ?? "Gemini key"),
+        masked: maskKey(String(r["api_key"] ?? "")),
+        active: Boolean(r["active"]),
+        failures: Number(r["failures"] ?? 0),
+        last_used_at: (r["last_used_at"] as string | null) ?? null,
+        created_at: String(r["created_at"]),
+      };
+    });
+  });
+
+/** Adds one or more Gemini keys to the rotation (paste several, one per line). */
+export const addGeminiKeys = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z.object({ label: z.string().max(60).optional(), keys: z.string().min(10) }).parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context);
+    const admin = await db();
+    const keys = [
+      ...new Set(
+        data.keys
+          .split(/[\s,]+/)
+          .map((k) => k.trim())
+          .filter((k) => k.length >= 10),
+      ),
+    ];
+    if (keys.length === 0) throw new Error("No usable key was found in that text.");
+
+    const base = (data.label ?? "").trim();
+    const rows = keys.map((api_key, index) => ({
+      api_key,
+      label: base ? (keys.length > 1 ? `${base} ${index + 1}` : base) : `Gemini key`,
+      active: true,
+    }));
+    const { error } = await admin.from("gemini_keys").insert(rows);
+    if (error) throw new Error(error.message);
+
+    const { clearGeminiKeyCache } = await import("./geminiKeys.server");
+    clearGeminiKeyCache();
+    return { added: keys.length };
+  });
+
+/** Renames a key, or turns it on/off in the rotation. */
+export const updateGeminiKey = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        id: z.string().uuid(),
+        label: z.string().min(1).max(60).optional(),
+        active: z.boolean().optional(),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context);
+    const admin = await db();
+    const patch: { label?: string; active?: boolean; failures?: number } = {};
+    if (data.label !== undefined) patch.label = data.label.trim();
+    if (data.active !== undefined) {
+      patch.active = data.active;
+      if (data.active) patch.failures = 0;
+    }
+    const { error } = await admin.from("gemini_keys").update(patch).eq("id", data.id);
+    if (error) throw new Error(error.message);
+
+    const { clearGeminiKeyCache } = await import("./geminiKeys.server");
+    clearGeminiKeyCache();
+    return { ok: true };
+  });
+
+/** Removes a key from the pool for good. */
+export const deleteGeminiKey = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) => z.object({ id: z.string().uuid() }).parse(input))
+  .handler(async ({ data, context }) => {
+    await assertAdmin(context);
+    const admin = await db();
+    const { error } = await admin.from("gemini_keys").delete().eq("id", data.id);
+    if (error) throw new Error(error.message);
+
+    const { clearGeminiKeyCache } = await import("./geminiKeys.server");
+    clearGeminiKeyCache();
+    return { ok: true };
+  });
+
+/** Calls Gemini with every saved key so the admin sees which ones still work. */
+export const testGeminiKeys = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    await assertAdmin(context);
+    const admin = await db();
+    const { data } = await admin.from("gemini_keys").select("*").order("created_at");
+    const rows = (data ?? []) as Record<string, unknown>[];
+
+    const results = await Promise.all(
+      rows.map(async (row) => {
+        const key = String(row["api_key"] ?? "");
+        try {
+          const res = await fetch(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+              body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "ping" }] }] }),
+            },
+          );
+          return { id: String(row["id"]), label: String(row["label"]), ok: res.ok };
+        } catch {
+          return { id: String(row["id"]), label: String(row["label"]), ok: false };
+        }
+      }),
+    );
+    return { results };
+  });
