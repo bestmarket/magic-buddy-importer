@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { Loader2, ShieldCheck, Sparkles, Volume2 } from "lucide-react";
+import { KeyRound, Loader2, ShieldCheck, Sparkles, Trash2, Volume2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
@@ -13,7 +13,12 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { VOICE_ENGINES } from "@/lib/voices";
 import {
+  addGeminiKeys,
   claimAdmin,
+  deleteGeminiKey,
+  listGeminiKeys,
+  testGeminiKeys,
+  updateGeminiKey,
   getAdminData,
   getAdminStatus,
   saveProvider,
@@ -23,6 +28,7 @@ import {
   testAiRouting,
   testVoice,
   type AdminData,
+  type AdminGeminiKey,
 } from "@/lib/admin.functions";
 
 export const Route = createFileRoute("/_authenticated/app/admin")({
@@ -193,6 +199,8 @@ function AdminDashboard() {
         pending={defaultsMutation.isPending}
         onSave={(defaults) => defaultsMutation.mutate({ data: defaults })}
       />
+
+      <GeminiKeysCard />
 
       <VoiceEnginesCard config={config} onSaved={refresh} />
 
@@ -494,6 +502,155 @@ function VoiceEnginesCard({
             </div>
           );
         })}
+      </CardContent>
+    </Card>
+  );
+}
+
+function GeminiKeysCard() {
+  const queryClient = useQueryClient();
+  const keys = useQuery({ queryKey: ["gemini-keys"], queryFn: () => listGeminiKeys() });
+  const refresh = () => queryClient.invalidateQueries({ queryKey: ["gemini-keys"] });
+  const [label, setLabel] = useState("");
+  const [text, setText] = useState("");
+
+  const add = useMutation({
+    mutationFn: useServerFn(addGeminiKeys),
+    onSuccess: (result: { added: number }) => {
+      toast.success(`${result.added} key${result.added === 1 ? "" : "s"} added`);
+      setText("");
+      setLabel("");
+      void refresh();
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const update = useMutation({
+    mutationFn: useServerFn(updateGeminiKey),
+    onSuccess: () => void refresh(),
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const remove = useMutation({
+    mutationFn: useServerFn(deleteGeminiKey),
+    onSuccess: () => {
+      toast.success("Key removed");
+      void refresh();
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const test = useMutation({
+    mutationFn: useServerFn(testGeminiKeys),
+    onSuccess: (result: { results: { label: string; ok: boolean }[] }) => {
+      const good = result.results.filter((r) => r.ok).length;
+      toast.success(`${good} of ${result.results.length} keys working`, {
+        description: result.results.map((r) => `${r.label}: ${r.ok ? "ok" : "failed"}`).join(" · "),
+      });
+      void refresh();
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  const rows: AdminGeminiKey[] = keys.data ?? [];
+  const activeCount = rows.filter((row) => row.active).length;
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <CardTitle>Google Gemini keys</CardTitle>
+            <CardDescription>
+              Add as many keys as you like. Writing and pictures take turns across them, so one key
+              running out never stops a video.
+            </CardDescription>
+          </div>
+          <Button
+            variant="outline"
+            disabled={test.isPending || rows.length === 0}
+            onClick={() => test.mutate({})}
+          >
+            {test.isPending ? <Loader2 className="animate-spin" /> : <KeyRound />}
+            Test keys
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="space-y-2">
+          <Label htmlFor="gemini-label">Name (optional)</Label>
+          <Input
+            id="gemini-label"
+            value={label}
+            placeholder="e.g. Main account"
+            onChange={(event) => setLabel(event.target.value)}
+          />
+          <Label htmlFor="gemini-keys">Keys</Label>
+          <textarea
+            id="gemini-keys"
+            value={text}
+            rows={3}
+            placeholder="Paste one key per line"
+            className="w-full rounded-md border border-input bg-background p-3 text-sm"
+            onChange={(event) => setText(event.target.value)}
+          />
+          <Button
+            disabled={add.isPending || text.trim().length < 10}
+            onClick={() => add.mutate({ data: { label, keys: text } })}
+          >
+            {add.isPending ? <Loader2 className="animate-spin" /> : null}
+            Add keys
+          </Button>
+        </div>
+
+        {keys.isLoading ? (
+          <Loader2 className="animate-spin text-muted-foreground" />
+        ) : rows.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No Gemini keys saved yet.</p>
+        ) : (
+          <div className="space-y-2">
+            <p className="text-xs font-medium uppercase text-muted-foreground">
+              {activeCount} of {rows.length} in rotation
+            </p>
+            {rows.map((row) => (
+              <div
+                key={row.id}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border p-3"
+              >
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium">{row.label}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {row.masked}
+                    {row.failures > 0 ? ` · ${row.failures} failures` : ""}
+                    {row.last_used_at
+                      ? ` · last used ${new Date(row.last_used_at).toLocaleString()}`
+                      : ""}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Badge variant={row.active ? "secondary" : "outline"}>
+                    {row.active ? "In rotation" : "Paused"}
+                  </Badge>
+                  <Switch
+                    checked={row.active}
+                    disabled={update.isPending}
+                    aria-label={`Use ${row.label}`}
+                    onCheckedChange={(active) => update.mutate({ data: { id: row.id, active } })}
+                  />
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    disabled={remove.isPending}
+                    aria-label={`Remove ${row.label}`}
+                    onClick={() => remove.mutate({ data: { id: row.id } })}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
